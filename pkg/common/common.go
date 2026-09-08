@@ -2,18 +2,20 @@ package common
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
-	"github.com/stakater/Reloader/internal/pkg/constants"
-	"github.com/stakater/Reloader/internal/pkg/options"
-	"github.com/stakater/Reloader/internal/pkg/util"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/stakater/Reloader/internal/pkg/constants"
+	"github.com/stakater/Reloader/internal/pkg/options"
+	"github.com/stakater/Reloader/internal/pkg/util"
 )
 
 type Map map[string]string
@@ -21,6 +23,7 @@ type Map map[string]string
 type ReloadCheckResult struct {
 	ShouldReload bool
 	AutoReload   bool
+	Errors       []error
 }
 
 // ReloaderOptions contains all configurable options for the Reloader controller.
@@ -77,6 +80,12 @@ type ReloaderOptions struct {
 	SyncAfterRestart bool `json:"syncAfterRestart"`
 	// EnableHA indicates whether High Availability mode is enabled with leader election
 	EnableHA bool `json:"enableHA"`
+	// LeaderElectionLeaseDuration is the duration non-leader candidates wait before force acquiring leadership, formatted as a Go duration string
+	LeaderElectionLeaseDuration string `json:"leaderElectionLeaseDuration"`
+	// LeaderElectionRenewDeadline is the duration the acting leader retries refreshing leadership before giving up, formatted as a Go duration string
+	LeaderElectionRenewDeadline string `json:"leaderElectionRenewDeadline"`
+	// LeaderElectionRetryPeriod is the duration clients wait between attempting acquisition and renewal of leadership, formatted as a Go duration string
+	LeaderElectionRetryPeriod string `json:"leaderElectionRetryPeriod"`
 	// EnableCSIIntegration indicates whether CSI integration is enabled to watch SecretProviderClassPodStatus
 	EnableCSIIntegration bool `json:"enableCSIIntegration"`
 	// WebhookUrl is the URL to send webhook notifications to instead of performing reloads
@@ -191,14 +200,24 @@ func GetResourceLabelSelector(slice []string) (string, error) {
 }
 
 // ShouldReload checks if a resource should be reloaded based on its annotations and the provided options.
-func ShouldReload(config Config, resourceType string, annotations Map, podAnnotations Map, options *ReloaderOptions) ReloadCheckResult {
+func ShouldReload(config Config, resourceType string, annotations Map, podAnnotations Map, reloaderOpts *ReloaderOptions) ReloadCheckResult {
 
-	// Check if this workload type should be ignored
-	if len(options.WorkloadTypesToIgnore) > 0 {
-		ignoredWorkloadTypes, err := util.GetIgnoredWorkloadTypesList()
-		if err != nil {
-			logrus.Errorf("Failed to parse ignored workload types: %v", err)
-		} else {
+	// Check if this workload type should be ignored.
+	// Use reloaderOpts.WorkloadTypesToIgnore directly instead of re-reading the
+	// global via util.GetIgnoredWorkloadTypesList(), so that invalid entries simply
+	// skip the ignore check (allowing reload) rather than silently blocking it.
+	if len(reloaderOpts.WorkloadTypesToIgnore) > 0 {
+		validIgnored := util.List{}
+		valid := true
+		for _, v := range reloaderOpts.WorkloadTypesToIgnore {
+			if v != "jobs" && v != "cronjobs" {
+				logrus.Errorf("Failed to parse ignored workload types: 'ignored-workload-types' accepts 'jobs', 'cronjobs', or both, not '%s'", v)
+				valid = false
+				break
+			}
+			validIgnored = append(validIgnored, v)
+		}
+		if valid {
 			// Map Kubernetes resource types to CLI-friendly names for comparison
 			var resourceToCheck string
 			switch resourceType {
@@ -207,19 +226,15 @@ func ShouldReload(config Config, resourceType string, annotations Map, podAnnota
 			case "CronJob":
 				resourceToCheck = "cronjobs"
 			default:
-				resourceToCheck = resourceType // For other types, use as-is
+				resourceToCheck = resourceType
 			}
-
-			// Check if current resource type should be ignored
-			if ignoredWorkloadTypes.Contains(resourceToCheck) {
-				return ReloadCheckResult{
-					ShouldReload: false,
-				}
+			if validIgnored.Contains(resourceToCheck) {
+				return ReloadCheckResult{ShouldReload: false}
 			}
 		}
 	}
 
-	ignoreResourceAnnotatonValue := config.ResourceAnnotations[options.IgnoreResourceAnnotation]
+	ignoreResourceAnnotatonValue := config.ResourceAnnotations[reloaderOpts.IgnoreResourceAnnotation]
 	if ignoreResourceAnnotatonValue == "true" {
 		return ReloadCheckResult{
 			ShouldReload: false,
@@ -227,18 +242,18 @@ func ShouldReload(config Config, resourceType string, annotations Map, podAnnota
 	}
 
 	annotationValue, found := annotations[config.Annotation]
-	searchAnnotationValue, foundSearchAnn := annotations[options.AutoSearchAnnotation]
-	reloaderEnabledValue, foundAuto := annotations[options.ReloaderAutoAnnotation]
+	searchAnnotationValue, foundSearchAnn := annotations[reloaderOpts.AutoSearchAnnotation]
+	reloaderEnabledValue, foundAuto := annotations[reloaderOpts.ReloaderAutoAnnotation]
 	typedAutoAnnotationEnabledValue, foundTypedAuto := annotations[config.TypedAutoAnnotation]
-	excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[options.ConfigmapExcludeReloaderAnnotation]
-	excludeSecretAnnotationValue, foundExcludeSecret := annotations[options.SecretExcludeReloaderAnnotation]
-	excludeSecretProviderClassProviderAnnotationValue, foundExcludeSecretProviderClass := annotations[options.SecretProviderClassExcludeReloaderAnnotation]
+	excludeConfigmapAnnotationValue, foundExcludeConfigmap := annotations[reloaderOpts.ConfigmapExcludeReloaderAnnotation]
+	excludeSecretAnnotationValue, foundExcludeSecret := annotations[reloaderOpts.SecretExcludeReloaderAnnotation]
+	excludeSecretProviderClassProviderAnnotationValue, foundExcludeSecretProviderClass := annotations[reloaderOpts.SecretProviderClassExcludeReloaderAnnotation]
 
 	if !found && !foundAuto && !foundTypedAuto && !foundSearchAnn {
 		annotations = podAnnotations
 		annotationValue = annotations[config.Annotation]
-		searchAnnotationValue = annotations[options.AutoSearchAnnotation]
-		reloaderEnabledValue = annotations[options.ReloaderAutoAnnotation]
+		searchAnnotationValue = annotations[reloaderOpts.AutoSearchAnnotation]
+		reloaderEnabledValue = annotations[reloaderOpts.ReloaderAutoAnnotation]
 		typedAutoAnnotationEnabledValue = annotations[config.TypedAutoAnnotation]
 	}
 
@@ -266,39 +281,48 @@ func ShouldReload(config Config, resourceType string, annotations Map, podAnnota
 		}
 	}
 
+	var regexErrors []error
 	values := strings.Split(annotationValue, ",")
 	for _, value := range values {
 		value = strings.TrimSpace(value)
-		re := regexp.MustCompile("^" + value + "$")
+		re, err := regexp.Compile("^" + value + "$")
+		if err != nil {
+			regexErrors = append(regexErrors, fmt.Errorf("invalid regex %q in reload annotation %q: %w", value, config.Annotation, err))
+			continue
+		}
 		if re.Match([]byte(config.ResourceName)) {
 			return ReloadCheckResult{
 				ShouldReload: true,
 				AutoReload:   false,
+				Errors:       regexErrors,
 			}
 		}
 	}
 
 	if searchAnnotationValue == "true" {
-		matchAnnotationValue := config.ResourceAnnotations[options.SearchMatchAnnotation]
+		matchAnnotationValue := config.ResourceAnnotations[reloaderOpts.SearchMatchAnnotation]
 		if matchAnnotationValue == "true" {
 			return ReloadCheckResult{
 				ShouldReload: true,
 				AutoReload:   true,
+				Errors:       regexErrors,
 			}
 		}
 	}
 
 	reloaderEnabled, _ := strconv.ParseBool(reloaderEnabledValue)
 	typedAutoAnnotationEnabled, _ := strconv.ParseBool(typedAutoAnnotationEnabledValue)
-	if reloaderEnabled || typedAutoAnnotationEnabled || reloaderEnabledValue == "" && typedAutoAnnotationEnabledValue == "" && options.AutoReloadAll {
+	if reloaderEnabled || typedAutoAnnotationEnabled || reloaderEnabledValue == "" && typedAutoAnnotationEnabledValue == "" && reloaderOpts.AutoReloadAll {
 		return ReloadCheckResult{
 			ShouldReload: true,
 			AutoReload:   true,
+			Errors:       regexErrors,
 		}
 	}
 
 	return ReloadCheckResult{
 		ShouldReload: false,
+		Errors:       regexErrors,
 	}
 }
 
@@ -348,6 +372,9 @@ func GetCommandLineOptions() *ReloaderOptions {
 	CommandLineOptions.ReloadStrategy = options.ReloadStrategy
 	CommandLineOptions.SyncAfterRestart = options.SyncAfterRestart
 	CommandLineOptions.EnableHA = options.EnableHA
+	CommandLineOptions.LeaderElectionLeaseDuration = options.LeaderElectionLeaseDuration.String()
+	CommandLineOptions.LeaderElectionRenewDeadline = options.LeaderElectionRenewDeadline.String()
+	CommandLineOptions.LeaderElectionRetryPeriod = options.LeaderElectionRetryPeriod.String()
 	CommandLineOptions.EnableCSIIntegration = options.EnableCSIIntegration
 	CommandLineOptions.WebhookUrl = options.WebhookUrl
 	CommandLineOptions.ResourcesToIgnore = options.ResourcesToIgnore

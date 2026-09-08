@@ -9,11 +9,12 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	v1 "k8s.io/api/core/v1"
+	csiv1 "sigs.k8s.io/secrets-store-csi-driver/apis/v1"
+
 	"github.com/stakater/Reloader/internal/pkg/constants"
 	"github.com/stakater/Reloader/internal/pkg/crypto"
 	"github.com/stakater/Reloader/internal/pkg/options"
-	v1 "k8s.io/api/core/v1"
-	csiv1 "sigs.k8s.io/secrets-store-csi-driver/apis/v1"
 )
 
 // ConvertToEnvVarName converts the given text into a usable env var
@@ -84,6 +85,7 @@ func ConfigureReloaderFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVar(&options.ConfigmapUpdateOnChangeAnnotation, "configmap-annotation", "configmap.reloader.stakater.com/reload", "annotation to detect changes in configmaps, specified by name")
 	cmd.PersistentFlags().StringVar(&options.SecretUpdateOnChangeAnnotation, "secret-annotation", "secret.reloader.stakater.com/reload", "annotation to detect changes in secrets, specified by name")
 	cmd.PersistentFlags().StringVar(&options.ReloaderAutoAnnotation, "auto-annotation", "reloader.stakater.com/auto", "annotation to detect changes in secrets/configmaps")
+	cmd.PersistentFlags().StringVar(&options.IgnoreResourceAnnotation, "ignore-annotation", "reloader.stakater.com/ignore", "annotation to ignore a resource when watching for changes in secrets/configmaps")
 	cmd.PersistentFlags().StringVar(&options.ConfigmapReloaderAutoAnnotation, "configmap-auto-annotation", "configmap.reloader.stakater.com/auto", "annotation to detect changes in configmaps")
 	cmd.PersistentFlags().StringVar(&options.SecretReloaderAutoAnnotation, "secret-auto-annotation", "secret.reloader.stakater.com/auto", "annotation to detect changes in secrets")
 	cmd.PersistentFlags().StringVar(&options.AutoSearchAnnotation, "auto-search-annotation", "reloader.stakater.com/search", "annotation to detect changes in configmaps or secrets tagged with special match annotation")
@@ -93,8 +95,9 @@ func ConfigureReloaderFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVar(&options.LogFormat, "log-format", "", "Log format to use (empty string for text, or JSON)")
 	cmd.PersistentFlags().StringVar(&options.LogLevel, "log-level", "info", "Log level to use (trace, debug, info, warning, error, fatal and panic)")
 	cmd.PersistentFlags().StringVar(&options.WebhookUrl, "webhook-url", "", "webhook to trigger instead of performing a reload")
-	cmd.PersistentFlags().StringSliceVar(&options.ResourcesToIgnore, "resources-to-ignore", options.ResourcesToIgnore, "list of resources to ignore (valid options 'configMaps' or 'secrets')")
+	cmd.PersistentFlags().StringSliceVar(&options.ResourcesToIgnore, "resources-to-ignore", options.ResourcesToIgnore, "list of resources to ignore (valid options 'configmaps' or 'secrets')")
 	cmd.PersistentFlags().StringSliceVar(&options.WorkloadTypesToIgnore, "ignored-workload-types", options.WorkloadTypesToIgnore, "list of workload types to ignore (valid options: 'jobs', 'cronjobs', or both)")
+	cmd.PersistentFlags().StringSliceVar(&options.Namespaces, "namespaces", options.Namespaces, "explicit list of namespaces to watch (scoped mode; creates no ClusterRole)")
 	cmd.PersistentFlags().StringSliceVar(&options.NamespacesToIgnore, "namespaces-to-ignore", options.NamespacesToIgnore, "list of namespaces to ignore")
 	cmd.PersistentFlags().StringSliceVar(&options.NamespaceSelectors, "namespace-selector", options.NamespaceSelectors, "list of key:value labels to filter on for namespaces")
 	cmd.PersistentFlags().StringSliceVar(&options.ResourceSelectors, "resource-label-selector", options.ResourceSelectors, "list of key:value labels to filter on for configmaps and secrets")
@@ -103,6 +106,9 @@ func ConfigureReloaderFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVar(&options.ReloadOnCreate, "reload-on-create", "false", "Add support to watch create events")
 	cmd.PersistentFlags().StringVar(&options.ReloadOnDelete, "reload-on-delete", "false", "Add support to watch delete events")
 	cmd.PersistentFlags().BoolVar(&options.EnableHA, "enable-ha", false, "Adds support for running multiple replicas via leadership election")
+	cmd.PersistentFlags().DurationVar(&options.LeaderElectionLeaseDuration, "leader-election-lease-duration", options.LeaderElectionLeaseDuration, "Duration non-leader candidates wait before force acquiring leadership, only used when --enable-ha is set")
+	cmd.PersistentFlags().DurationVar(&options.LeaderElectionRenewDeadline, "leader-election-renew-deadline", options.LeaderElectionRenewDeadline, "Duration the acting leader retries refreshing leadership before giving up, only used when --enable-ha is set")
+	cmd.PersistentFlags().DurationVar(&options.LeaderElectionRetryPeriod, "leader-election-retry-period", options.LeaderElectionRetryPeriod, "Duration clients wait between attempting acquisition and renewal of leadership, only used when --enable-ha is set")
 	cmd.PersistentFlags().BoolVar(&options.SyncAfterRestart, "sync-after-restart", false, "Sync add events after reloader restarts")
 	cmd.PersistentFlags().BoolVar(&options.EnablePProf, "enable-pprof", false, "Enable pprof for profiling")
 	cmd.PersistentFlags().StringVar(&options.PProfAddr, "pprof-addr", ":6060", "Address to start pprof server on. Default is :6060")
@@ -113,17 +119,26 @@ func GetIgnoredResourcesList() (List, error) {
 
 	ignoredResourcesList := options.ResourcesToIgnore // getStringSliceFromFlags(cmd, "resources-to-ignore")
 
+	// Normalize to the canonical lowercase keys used in kube.ResourceMap so the
+	// comparison is case-insensitive (e.g. "configMaps", "ConfigMaps", "sEcrets"
+	// all map to their canonical lowercase form).
+	normalized := make(List, 0, len(ignoredResourcesList))
 	for _, v := range ignoredResourcesList {
-		if v != "configMaps" && v != "secrets" {
-			return nil, fmt.Errorf("'resources-to-ignore' only accepts 'configMaps' or 'secrets', not '%s'", v)
+		switch strings.ToLower(v) {
+		case "configmaps":
+			normalized = append(normalized, "configmaps")
+		case "secrets":
+			normalized = append(normalized, "secrets")
+		default:
+			return nil, fmt.Errorf("'resources-to-ignore' only accepts 'configmaps' or 'secrets', not '%s'", v)
 		}
 	}
 
-	if len(ignoredResourcesList) > 1 {
-		return nil, errors.New("'resources-to-ignore' only accepts 'configMaps' or 'secrets', not both")
+	if len(normalized) > 1 {
+		return nil, errors.New("'resources-to-ignore' only accepts 'configmaps' or 'secrets', not both")
 	}
 
-	return ignoredResourcesList, nil
+	return normalized, nil
 }
 
 func GetIgnoredWorkloadTypesList() (List, error) {

@@ -6,14 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stakater/Reloader/internal/pkg/options"
-	"github.com/stakater/Reloader/pkg/kube"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	testclient "k8s.io/client-go/kubernetes/fake"
+
+	"github.com/stakater/Reloader/internal/pkg/options"
+	"github.com/stakater/Reloader/pkg/kube"
 )
 
 func TestIsPaused(t *testing.T) {
@@ -175,6 +176,18 @@ func TestParsePauseDuration(t *testing.T) {
 		{
 			name:               "invalid duration",
 			pauseIntervalValue: "invalid",
+			expectedDuration:   0,
+			invalidDuration:    true,
+		},
+		{
+			name:               "zero duration",
+			pauseIntervalValue: "0s",
+			expectedDuration:   0,
+			invalidDuration:    true,
+		},
+		{
+			name:               "negative duration",
+			pauseIntervalValue: "-5m",
 			expectedDuration:   0,
 			invalidDuration:    true,
 		},
@@ -377,7 +390,7 @@ func FindDeploymentByName(deployments []runtime.Object, deploymentName string) (
 	for _, deployment := range deployments {
 		accessor, err := meta.Accessor(deployment)
 		if err != nil {
-			return nil, fmt.Errorf("error getting accessor for item: %v", err)
+			return nil, fmt.Errorf("error getting accessor for item: %w", err)
 		}
 		if accessor.GetName() == deploymentName {
 			deploymentObj, ok := deployment.(*appsv1.Deployment)

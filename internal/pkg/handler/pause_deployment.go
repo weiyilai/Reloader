@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/stakater/Reloader/internal/pkg/options"
-	"github.com/stakater/Reloader/pkg/kube"
 	app "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	patchtypes "k8s.io/apimachinery/pkg/types"
+
+	"github.com/stakater/Reloader/internal/pkg/options"
+	"github.com/stakater/Reloader/pkg/kube"
 )
 
 // Keeps track of currently active timers
@@ -56,6 +57,11 @@ func ParsePauseDuration(pauseIntervalValue string) (time.Duration, error) {
 	pauseDuration, err := time.ParseDuration(pauseIntervalValue)
 	if err != nil {
 		logrus.Warnf("Failed to parse pause interval value '%s': %v", pauseIntervalValue, err)
+		return 0, err
+	}
+	if pauseDuration <= 0 {
+		err = fmt.Errorf("pause interval must be positive, got '%s'", pauseIntervalValue)
+		logrus.Warn(err)
 		return 0, err
 	}
 	return pauseDuration, nil

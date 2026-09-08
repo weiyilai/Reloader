@@ -1,7 +1,9 @@
 package common
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stakater/Reloader/internal/pkg/options"
 )
@@ -220,5 +222,91 @@ func TestShouldReload_IssueRBACPermissionFixed(t *testing.T) {
 
 			t.Logf("✓ %s", tt.description)
 		})
+	}
+}
+
+// A malformed regex in a named reload annotation must not panic the operator.
+// Regression test: previously regexp.MustCompile("^"+value+"$") panicked on an
+// invalid pattern, crashing Reloader cluster-wide (no recover on the worker).
+func TestShouldReload_InvalidRegexAnnotation_DoesNotPanic(t *testing.T) {
+	config := Config{
+		ResourceName: "app-config",
+		Annotation:   "secret.reloader.stakater.com/reload",
+	}
+	annotations := Map{
+		// unbalanced bracket => invalid regex
+		"secret.reloader.stakater.com/reload": "app-config[",
+	}
+	opts := &ReloaderOptions{
+		ReloaderAutoAnnotation: "reloader.stakater.com/auto",
+	}
+
+	// Before the fix this panicked inside ShouldReload.
+	result := ShouldReload(config, "Deployment", annotations, Map{}, opts)
+
+	if result.ShouldReload {
+		t.Errorf("Expected ShouldReload=false for an invalid regex pattern, got=%v", result.ShouldReload)
+	}
+	if len(result.Errors) != 1 {
+		t.Errorf("Expected 1 surfaced regex error, got=%d: %v", len(result.Errors), result.Errors)
+	}
+}
+
+// When a named reload annotation holds several comma-separated patterns, a
+// single malformed one is skipped while a valid one still matches, and the
+// skipped pattern's error is surfaced on the result.
+func TestShouldReload_InvalidRegexAnnotation_SkipsMalformedPattern(t *testing.T) {
+	config := Config{
+		ResourceName: "app-config",
+		Annotation:   "secret.reloader.stakater.com/reload",
+	}
+	annotations := Map{
+		// first pattern is invalid (unbalanced bracket), second matches
+		"secret.reloader.stakater.com/reload": "bad[,app-config",
+	}
+	opts := &ReloaderOptions{
+		ReloaderAutoAnnotation: "reloader.stakater.com/auto",
+	}
+
+	result := ShouldReload(config, "Deployment", annotations, Map{}, opts)
+
+	if !result.ShouldReload {
+		t.Errorf("Expected ShouldReload=true from the valid pattern, got=%v", result.ShouldReload)
+	}
+	if len(result.Errors) != 1 {
+		t.Errorf("Expected the malformed pattern to surface 1 error, got=%d: %v", len(result.Errors), result.Errors)
+	}
+}
+
+func TestGetCommandLineOptions_LeaderElectionTimingsAreDurationStrings(t *testing.T) {
+	origLease, origRenew, origRetry := options.LeaderElectionLeaseDuration, options.LeaderElectionRenewDeadline, options.LeaderElectionRetryPeriod
+	defer func() {
+		options.LeaderElectionLeaseDuration, options.LeaderElectionRenewDeadline, options.LeaderElectionRetryPeriod = origLease, origRenew, origRetry
+	}()
+	options.LeaderElectionLeaseDuration = 30 * time.Second
+	options.LeaderElectionRenewDeadline = 20 * time.Second
+	options.LeaderElectionRetryPeriod = 4 * time.Second
+
+	// the meta-info ConfigMap holds the marshalled options, so the timings must
+	// read as durations there rather than as raw nanoseconds
+	encoded, err := json.Marshal(GetCommandLineOptions())
+	if err != nil {
+		t.Fatalf("Expected the options to marshal, got err=%v", err)
+	}
+
+	decoded := map[string]any{}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Expected the options to unmarshal, got err=%v", err)
+	}
+
+	expected := map[string]string{
+		"leaderElectionLeaseDuration": "30s",
+		"leaderElectionRenewDeadline": "20s",
+		"leaderElectionRetryPeriod":   "4s",
+	}
+	for key, want := range expected {
+		if got := decoded[key]; got != want {
+			t.Errorf("Expected %s=%q, got=%#v", key, want, got)
+		}
 	}
 }
