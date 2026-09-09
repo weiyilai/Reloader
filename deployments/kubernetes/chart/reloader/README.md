@@ -169,7 +169,7 @@ helm uninstall {{RELEASE_NAME}} -n {{NAMESPACE}}
 #### 🗳️ `enableHA` Behavior
 **When true:**
 ✅ `--enable-ha=true` and the `POD_NAME`/`POD_NAMESPACE` env vars are rendered
-✅ The `coordination.k8s.io` Lease RBAC is rendered when `reloader.rbac.enabled` is `true`
+✅ The `coordination.k8s.io` Lease RBAC is rendered when `reloader.rbac.enabled` is `true`. It always lands in the namespaced `-metadata-role` in the release namespace, never in the ClusterRole and never in the watched namespace Roles, and `get`/`update` are restricted to the `stakater-reloader-lock` lease
 ✅ The default pod anti-affinity is rendered unless custom affinity is configured
 ✅ `reloader.deployment.replicas` is honored, and any `reloader.leaderElection.*` timings are passed to the binary
 
